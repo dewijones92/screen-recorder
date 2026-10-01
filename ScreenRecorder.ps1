@@ -4,16 +4,24 @@ param(
     [int]$ScreenIndex = 0,
     [string]$Mic,
     [string]$Webcam,
-    [switch]$ForceGdi
+    [switch]$ForceGdi,
+    [string]$Quality,
+    [string]$OutDir
 )
 
 $ErrorActionPreference = 'Stop'
 $ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogFile = Join-Path $ToolDir 'ScreenRecorder.log'
-$OutDir = [Environment]::GetFolderPath('MyVideos')
-$OutHeight = 720
-$Fps = 15
-$CamSize = [int]($OutHeight / 5)
+if (-not $OutDir) { $OutDir = [Environment]::GetFolderPath('MyVideos') }
+$SettingsFile = Join-Path $ToolDir 'settings.json'
+$Presets = @(
+    [pscustomobject]@{ Name = 'Small';    H = 720;  Fps = 15; Crf = 28; Label = 'Small - 720p, ~1 MB/min' }
+    [pscustomobject]@{ Name = 'Balanced'; H = 1080; Fps = 15; Crf = 26; Label = 'Balanced - 1080p, ~1.5 MB/min' }
+    [pscustomobject]@{ Name = 'Sharp';    H = 1440; Fps = 15; Crf = 24; Label = 'Sharp - 1440p, ~4.5 MB/min' }
+    [pscustomobject]@{ Name = 'Smooth';   H = 1080; Fps = 30; Crf = 26; Label = 'Smooth - 1080p 30fps, ~1.5 MB/min' }
+)
+$DefaultPreset = 'Balanced'
+$script:enc = $null
 $CamMargin = 16
 $ToggleFile = Join-Path $ToolDir 'toggle.request'
 
@@ -102,21 +110,21 @@ function Build-FfmpegArgs($screen, [bool]$useDda, [string]$mic, [string]$cam, [s
         $screenIdx = 1
     }
     if ($useDda) {
-        $a.AddRange([string[]]@('-thread_queue_size', '1024', '-f', 'lavfi', '-i', ("ddagrab=output_idx=0:framerate={0}:video_size={1}x{2}" -f $Fps, $screen.W, $screen.H)))
-        $scr = "[${screenIdx}:v]hwdownload,format=bgra,scale=-2:$OutHeight"
+        $a.AddRange([string[]]@('-thread_queue_size', '1024', '-f', 'lavfi', '-i', ("ddagrab=output_idx=0:framerate={0}:video_size={1}x{2}" -f $script:enc.Fps, $screen.W, $screen.H)))
+        $scr = "[${screenIdx}:v]hwdownload,format=bgra,scale=-2:$($script:enc.H)"
     } else {
-        $a.AddRange([string[]]@('-thread_queue_size', '1024', '-f', 'gdigrab', '-framerate', "$Fps", '-draw_mouse', '1',
+        $a.AddRange([string[]]@('-thread_queue_size', '1024', '-f', 'gdigrab', '-framerate', "$($script:enc.Fps)", '-draw_mouse', '1',
                 '-offset_x', "$($screen.X)", '-offset_y', "$($screen.Y)", '-video_size', ("{0}x{1}" -f $screen.W, $screen.H), '-i', 'desktop'))
-        $scr = "[${screenIdx}:v]scale=-2:$OutHeight"
+        $scr = "[${screenIdx}:v]scale=-2:$($script:enc.H)"
     }
     if ($cam) {
-        $fc = "$scr[scr];[0:v]fps=$Fps,crop='min(iw,ih)':'min(iw,ih)',scale=${CamSize}:${CamSize}[cam];[scr][cam]overlay=W-w-${CamMargin}:H-h-${CamMargin},format=yuv420p[v]"
+        $fc = "$scr[scr];[0:v]fps=$($script:enc.Fps),crop='min(iw,ih)':'min(iw,ih)',scale=$($script:enc.Cam):$($script:enc.Cam)[cam];[scr][cam]overlay=W-w-${CamMargin}:H-h-${CamMargin},format=yuv420p[v]"
     } else {
         $fc = "$scr,format=yuv420p[v]"
     }
     $a.AddRange([string[]]@('-filter_complex', $fc, '-map', '[v]'))
     if ($mic) { $a.AddRange([string[]]@('-map', '0:a', '-c:a', 'aac', '-b:a', '64k', '-ac', '1')) }
-    $a.AddRange([string[]]@('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-r', "$Fps", $outFile))
+    $a.AddRange([string[]]@('-c:v', 'libx264', '-preset', 'veryfast', '-crf', "$($script:enc.Crf)", '-r', "$($script:enc.Fps)", $outFile))
     , $a
 }
 
@@ -181,10 +189,30 @@ $script:outFile = $null
 $script:startedAt = $null
 $script:config = $null
 
-function Start-Recording($screen, [string]$mic, [string]$cam, [bool]$forceGdi) {
+function Get-Preset([string]$name) {
+    $p = $Presets | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    if ($p) { $p } else { $Presets | Where-Object { $_.Name -eq $DefaultPreset } }
+}
+
+function Read-SavedPreset {
+    try { (Get-Content $SettingsFile -Raw | ConvertFrom-Json).Quality } catch { $null }
+}
+
+function Save-Settings([string]$quality) {
+    try { @{ Quality = $quality } | ConvertTo-Json | Set-Content -Path $SettingsFile -Encoding UTF8 } catch { Write-Log "saving settings failed: $_" }
+}
+
+function Start-Recording($screen, [string]$mic, [string]$cam, [bool]$forceGdi, [string]$quality) {
+    $preset = Get-Preset $quality
+    $h = [Math]::Min($preset.H, $screen.H)
+    $h = $h - ($h % 2)
+    $camSize = [int]($h / 5)
+    $camSize = $camSize - ($camSize % 2)
+    $script:enc = [pscustomobject]@{ Name = $preset.Name; H = $h; Fps = $preset.Fps; Crf = $preset.Crf; Cam = $camSize }
+    Write-Log ("quality {0}: height={1} fps={2} crf={3} cam={4}" -f $preset.Name, $h, $preset.Fps, $preset.Crf, $camSize)
     $script:outFile = New-OutputPath
     $useDda = $screen.Primary -and -not $forceGdi
-    $script:config = @{ Screen = $screen; Mic = $mic; Cam = $cam; UseDda = $useDda }
+    $script:config = @{ Screen = $screen; Mic = $mic; Cam = $cam; UseDda = $useDda; Quality = $preset.Name }
     Write-Log ("record screen={0} dda={1} mic={2} cam={3} out={4}" -f $screen.Label, $useDda, $mic, $cam, $script:outFile)
     $report = Join-Path $ToolDir 'ffmpeg-last.log'
     $script:proc = Start-Ffmpeg $script:ffmpeg (Build-FfmpegArgs $screen $useDda $mic $cam $script:outFile) $report
@@ -196,7 +224,7 @@ function Test-FallbackNeeded {
     $early = ((Get-Date) - $script:startedAt).TotalSeconds -lt 8
     if ($early -and $script:config.UseDda) {
         Write-Log "GPU capture exited early code=$($script:proc.ExitCode), retrying with gdigrab"
-        Start-Recording $script:config.Screen $script:config.Mic $script:config.Cam $true
+        Start-Recording $script:config.Screen $script:config.Mic $script:config.Cam $true $script:config.Quality
         return $true
     }
     return $false
@@ -206,7 +234,7 @@ if ($Headless) {
     $screen = $script:screens[$ScreenIndex]
     $micName = if ($Mic -eq 'none') { $null } elseif ($Mic) { $Mic } else { $defaultMic }
     $camName = if ($Webcam -eq 'none') { $null } elseif ($Webcam) { $Webcam } else { $defaultCam }
-    Start-Recording $screen $micName $camName ([bool]$ForceGdi)
+    Start-Recording $screen $micName $camName ([bool]$ForceGdi) $Quality
     $end = (Get-Date).AddSeconds($Seconds)
     while ((Get-Date) -lt $end) {
         Start-Sleep -Milliseconds 500
@@ -225,7 +253,7 @@ $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-$form.ClientSize = New-Object System.Drawing.Size(360, 200)
+$form.ClientSize = New-Object System.Drawing.Size(360, 232)
 
 function Add-Row([string]$text, [int]$y) {
     $lbl = New-Object System.Windows.Forms.Label
@@ -251,23 +279,28 @@ $cbCam = Add-Row 'Webcam' 78
 foreach ($c in $script:devices.Video) { [void]$cbCam.Items.Add($c) }
 $cbCam.SelectedIndex = if ($defaultCam) { $cbCam.Items.IndexOf($defaultCam) } else { 0 }
 
+$cbQuality = Add-Row 'Quality' 110
+foreach ($p in $Presets) { [void]$cbQuality.Items.Add($p.Label) }
+$savedPreset = Get-Preset (Read-SavedPreset)
+$cbQuality.SelectedIndex = [array]::IndexOf(@($Presets | ForEach-Object Name), $savedPreset.Name)
+
 $btnRec = New-Object System.Windows.Forms.Button
-$btnRec.Text = 'Record'; $btnRec.Location = New-Object System.Drawing.Point(80, 116); $btnRec.Size = New-Object System.Drawing.Size(84, 30)
+$btnRec.Text = 'Record'; $btnRec.Location = New-Object System.Drawing.Point(80, 148); $btnRec.Size = New-Object System.Drawing.Size(84, 30)
 $btnRec.ForeColor = [System.Drawing.Color]::DarkRed
 $form.Controls.Add($btnRec)
 $form.AcceptButton = $btnRec
 
 $btnStop = New-Object System.Windows.Forms.Button
-$btnStop.Text = 'Stop'; $btnStop.Location = New-Object System.Drawing.Point(170, 116); $btnStop.Size = New-Object System.Drawing.Size(84, 30)
+$btnStop.Text = 'Stop'; $btnStop.Location = New-Object System.Drawing.Point(170, 148); $btnStop.Size = New-Object System.Drawing.Size(84, 30)
 $btnStop.Enabled = $false
 $form.Controls.Add($btnStop)
 
 $btnFolder = New-Object System.Windows.Forms.Button
-$btnFolder.Text = 'Open folder'; $btnFolder.Location = New-Object System.Drawing.Point(260, 116); $btnFolder.Size = New-Object System.Drawing.Size(84, 30)
+$btnFolder.Text = 'Open folder'; $btnFolder.Location = New-Object System.Drawing.Point(260, 148); $btnFolder.Size = New-Object System.Drawing.Size(84, 30)
 $form.Controls.Add($btnFolder)
 
 $lblStatus = New-Object System.Windows.Forms.Label
-$lblStatus.Location = New-Object System.Drawing.Point(14, 160); $lblStatus.Size = New-Object System.Drawing.Size(330, 34)
+$lblStatus.Location = New-Object System.Drawing.Point(14, 192); $lblStatus.Size = New-Object System.Drawing.Size(330, 34)
 $lblStatus.Text = 'Ready. Recordings go to your Videos folder.'
 $form.Controls.Add($lblStatus)
 
@@ -277,7 +310,7 @@ $timer.Interval = 1000
 function Set-Idle([string]$status) {
     $timer.Stop()
     $btnRec.Enabled = $true; $btnStop.Enabled = $false
-    $cbScreen.Enabled = $true; $cbMic.Enabled = $true; $cbCam.Enabled = $true
+    $cbScreen.Enabled = $true; $cbMic.Enabled = $true; $cbCam.Enabled = $true; $cbQuality.Enabled = $true
     $form.Text = 'Screen Recorder'
     $form.WindowState = 'Normal'
     $form.Activate()
@@ -308,9 +341,11 @@ function Invoke-Record {
             $screen = $script:screens[$cbScreen.SelectedIndex]
             $mic = if ($cbMic.SelectedIndex -gt 0) { [string]$cbMic.SelectedItem } else { $null }
             $cam = if ($cbCam.SelectedIndex -gt 0) { [string]$cbCam.SelectedItem } else { $null }
-            Start-Recording $screen $mic $cam $false
+            $quality = $Presets[$cbQuality.SelectedIndex].Name
+            Save-Settings $quality
+            Start-Recording $screen $mic $cam $false $quality
             $btnRec.Enabled = $false; $btnStop.Enabled = $true
-            $cbScreen.Enabled = $false; $cbMic.Enabled = $false; $cbCam.Enabled = $false
+            $cbScreen.Enabled = $false; $cbMic.Enabled = $false; $cbCam.Enabled = $false; $cbQuality.Enabled = $false
             $lblStatus.Text = 'Recording... 00:00'
             $form.Text = 'REC - Screen Recorder'
             $timer.Start()
