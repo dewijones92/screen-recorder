@@ -15,7 +15,16 @@ ffmpeg already installed through winget, so nothing else to install.
 - **Ctrl+Alt+R**: opens the app; press again to start recording; again to stop.
 - Or the **Screen Recorder** shortcut on the desktop.
 
-The window minimises while recording so it stays out of the video.
+- A live webcam square sits in the bottom-right corner of the chosen screen, exactly where it will
+  appear in the video. **Drag it** anywhere, before or during recording; the recording follows.
+- Record starts a **3-2-1 countdown** in the middle of the screen. The camera and mic open during
+  the countdown, so the video starts within about half a second of "1".
+- The app window, the webcam square and the countdown are all excluded from capture
+  (`SetWindowDisplayAffinity` with `WDA_EXCLUDEFROMCAPTURE`), so none of them appear in the video.
+  The webcam in the video is ffmpeg's own overlay, in sync with the mic.
+- Pressing the hotkey during the countdown cancels the recording.
+
+The window minimises while recording.
 
 ## Install / update
 
@@ -34,6 +43,11 @@ from `\\wsl$`), creates the desktop shortcut, adds one `#Include` line to
 - Other screens: `gdigrab` with the screen's physical-pixel bounds. `ddagrab` cannot reach a screen
   driven by the other GPU on this laptop.
 - Mic and webcam come in as one DirectShow input so they share a clock.
+- The live preview is a second ffmpeg output (MJPEG on stdout) read by a small C# window. Before
+  recording, a separate preview-only ffmpeg feeds it; it hands the camera over on Record.
+- Dragging the square sends `overlay@cam` x/y commands to the running ffmpeg on stdin (`c` key).
+- Recording counts as started when ffmpeg's `-progress` output reports `out_time_us > 0`. The
+  file size is no use for this: ffmpeg buffers the first 32 KB, so the file reads as empty for seconds.
 - The hotkey does not click the window: it drops `toggle.request` next to the app, which polls for
   it every 200 ms. AutoHotkey's ControlClick does not reach a minimised WinForms window.
 
@@ -45,5 +59,5 @@ powershell -ExecutionPolicy Bypass -File ScreenRecorder.ps1 -Headless -Seconds 8
 
 ## Logs
 
-Next to the deployed app: `ScreenRecorder.log` (decisions and full ffmpeg command line),
+Next to the deployed app: `ScreenRecorder.log` (decisions, overlay positions, preview frame counts, full ffmpeg command line),
 `ffmpeg-last.log` (ffmpeg's own report for the last recording), `hotkey.log`.

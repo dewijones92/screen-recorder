@@ -23,17 +23,190 @@ $Presets = @(
 $DefaultPreset = 'Balanced'
 $script:enc = $null
 $CamMargin = 16
+$PreviewSize = 240
+$script:bubble = $null
 $ToggleFile = Join-Path $ToolDir 'toggle.request'
+$ProgressFile = Join-Path $ToolDir 'progress.txt'
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-Add-Type @"
+$NativeCode = @'
 using System;
+using System.Drawing;
+using System.IO;
+using System.Threading;
+using System.Windows.Forms;
 using System.Runtime.InteropServices;
+
 public static class RecDpi {
     [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
+    [DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr h, uint affinity);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+    [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
+
+    public static bool ExcludeFromCapture(IntPtr h) { return SetWindowDisplayAffinity(h, 0x11); }
+
+    public static void PlacePhysical(IntPtr h, int x, int y, int w, int height) {
+        IntPtr old = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try { SetWindowPos(h, new IntPtr(-1), x, y, w, height, 0x0010); }
+        finally { SetThreadDpiAwarenessContext(old); }
+    }
+
+    public static int[] RectPhysical(IntPtr h) {
+        IntPtr old = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try {
+            RECT r;
+            GetWindowRect(h, out r);
+            return new int[] { r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top };
+        }
+        finally { SetThreadDpiAwarenessContext(old); }
+    }
 }
-"@
+
+public class CamBubble : Form {
+    readonly PictureBox box = new PictureBox();
+    volatile bool pending;
+    long frames;
+    long badFrames;
+    public string LastError = "";
+    public event EventHandler DragEnded;
+    public long Frames { get { return Interlocked.Read(ref frames); } }
+    public long BadFrames { get { return Interlocked.Read(ref badFrames); } }
+
+    public CamBubble() {
+        FormBorderStyle = FormBorderStyle.None;
+        TopMost = true;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.Manual;
+        Location = new Point(-32000, -32000);
+        BackColor = Color.Black;
+        box.Dock = DockStyle.Fill;
+        box.SizeMode = PictureBoxSizeMode.Zoom;
+        box.Cursor = Cursors.SizeAll;
+        box.MouseDown += OnBoxMouseDown;
+        Controls.Add(box);
+    }
+
+    protected override bool ShowWithoutActivation { get { return true; } }
+
+    protected override void OnHandleCreated(EventArgs e) {
+        base.OnHandleCreated(e);
+        RecDpi.ExcludeFromCapture(Handle);
+    }
+
+    void OnBoxMouseDown(object sender, MouseEventArgs e) {
+        if (e.Button != MouseButtons.Left) return;
+        RecDpi.ReleaseCapture();
+        RecDpi.SendMessage(Handle, 0xA1, new IntPtr(2), IntPtr.Zero);
+        EventHandler handler = DragEnded;
+        if (handler != null) handler(this, EventArgs.Empty);
+    }
+
+    public void Attach(Stream stream) {
+        Thread t = new Thread(() => ReadLoop(stream));
+        t.IsBackground = true;
+        t.Start();
+    }
+
+    void ReadLoop(Stream stream) {
+        byte[] buf = new byte[4 << 20];
+        int len = 0;
+        try {
+            while (true) {
+                if (len == buf.Length) len = 0;
+                int n = stream.Read(buf, len, buf.Length - len);
+                if (n <= 0) break;
+                len += n;
+                int pos = 0;
+                while (true) {
+                    int start = Find(buf, pos, len, 0xD8);
+                    if (start < 0) { pos = Math.Max(pos, len - 1); break; }
+                    int end = Find(buf, start + 2, len, 0xD9);
+                    if (end < 0) { pos = start; break; }
+                    int frameLen = end + 2 - start;
+                    byte[] jpg = new byte[frameLen];
+                    Buffer.BlockCopy(buf, start, jpg, 0, frameLen);
+                    pos = end + 2;
+                    Deliver(jpg);
+                }
+                if (pos > 0) {
+                    Buffer.BlockCopy(buf, pos, buf, 0, len - pos);
+                    len -= pos;
+                }
+            }
+            LastError = "preview stream ended";
+        } catch (Exception ex) {
+            LastError = "preview read: " + ex.GetType().Name + ": " + ex.Message;
+        }
+    }
+
+    static int Find(byte[] b, int from, int to, byte marker) {
+        for (int i = from; i < to - 1; i++) if (b[i] == 0xFF && b[i + 1] == marker) return i;
+        return -1;
+    }
+
+    void Deliver(byte[] jpg) {
+        Interlocked.Increment(ref frames);
+        if (pending || IsDisposed || !IsHandleCreated) return;
+        Bitmap bmp;
+        try {
+            using (MemoryStream ms = new MemoryStream(jpg))
+            using (Image img = Image.FromStream(ms)) {
+                bmp = new Bitmap(img);
+            }
+        } catch (Exception ex) {
+            Interlocked.Increment(ref badFrames);
+            LastError = "bad frame: " + ex.Message;
+            return;
+        }
+        pending = true;
+        try {
+            BeginInvoke((MethodInvoker)delegate {
+                Image old = box.Image;
+                box.Image = bmp;
+                if (old != null) old.Dispose();
+                pending = false;
+            });
+        } catch (Exception ex) {
+            pending = false;
+            bmp.Dispose();
+            LastError = "preview invoke: " + ex.Message;
+        }
+    }
+}
+
+public class CountdownForm : Form {
+    readonly Label label = new Label();
+
+    public CountdownForm() {
+        FormBorderStyle = FormBorderStyle.None;
+        TopMost = true;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.Manual;
+        Location = new Point(-32000, -32000);
+        BackColor = Color.Black;
+        Opacity = 0.8;
+        label.Dock = DockStyle.Fill;
+        label.ForeColor = Color.White;
+        label.TextAlign = ContentAlignment.MiddleCenter;
+        label.Font = new Font("Segoe UI", 72, FontStyle.Bold);
+        Controls.Add(label);
+    }
+
+    public string Value { get { return label.Text; } set { label.Text = value; } }
+
+    protected override bool ShowWithoutActivation { get { return true; } }
+
+    protected override void OnHandleCreated(EventArgs e) {
+        base.OnHandleCreated(e);
+        RecDpi.ExcludeFromCapture(Handle);
+    }
+}
+'@
+Add-Type -TypeDefinition $NativeCode -ReferencedAssemblies System.Windows.Forms, System.Drawing
 
 function Write-Log([string]$msg) {
     $line = '{0:yyyy-MM-dd HH:mm:ss.fff} {1}' -f (Get-Date), $msg
@@ -96,8 +269,9 @@ function Join-Args($list) {
 }
 
 function Build-FfmpegArgs($screen, [bool]$useDda, [string]$mic, [string]$cam, [string]$outFile) {
+    $e = $script:enc
     $a = New-Object System.Collections.Generic.List[string]
-    $a.AddRange([string[]]@('-hide_banner', '-y'))
+    $a.AddRange([string[]]@('-hide_banner', '-y', '-progress', $ProgressFile))
     $screenIdx = 0
     $parts = @()
     if ($cam) { $parts += "video=$cam" }
@@ -118,24 +292,32 @@ function Build-FfmpegArgs($screen, [bool]$useDda, [string]$mic, [string]$cam, [s
         $scr = "[${screenIdx}:v]scale=-2:$($script:enc.H)"
     }
     if ($cam) {
-        $fc = "$scr[scr];[0:v]fps=$($script:enc.Fps),crop='min(iw,ih)':'min(iw,ih)',scale=$($script:enc.Cam):$($script:enc.Cam)[cam];[scr][cam]overlay=W-w-${CamMargin}:H-h-${CamMargin},format=yuv420p[v]"
+        $camChain = "[0:v]fps=$($e.Fps),crop='min(iw,ih)':'min(iw,ih)'"
+        if ($e.Preview) {
+            $camChain += ",split=2[c1][c2];[c1]scale=$($e.Cam):$($e.Cam)[cam];[c2]scale=${PreviewSize}:${PreviewSize},format=yuvj420p[prev]"
+        } else {
+            $camChain += ",scale=$($e.Cam):$($e.Cam)[cam]"
+        }
+        $fc = "$scr[scr];$camChain;[scr][cam]overlay@cam=x=$($e.OX):y=$($e.OY),format=yuv420p[v]"
     } else {
         $fc = "$scr,format=yuv420p[v]"
     }
     $a.AddRange([string[]]@('-filter_complex', $fc, '-map', '[v]'))
     if ($mic) { $a.AddRange([string[]]@('-map', '0:a', '-c:a', 'aac', '-b:a', '64k', '-ac', '1')) }
     $a.AddRange([string[]]@('-c:v', 'libx264', '-preset', 'veryfast', '-crf', "$($script:enc.Crf)", '-r', "$($script:enc.Fps)", $outFile))
+    if ($cam -and $e.Preview) { $a.AddRange([string[]]@('-map', '[prev]', '-c:v', 'mjpeg', '-q:v', '5', '-f', 'mjpeg', 'pipe:1')) }
     , $a
 }
 
-function Start-Ffmpeg([string]$ffmpeg, $argList, [string]$reportPath) {
+function Start-Ffmpeg([string]$ffmpeg, $argList, [string]$reportPath, [bool]$readStdout) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $ffmpeg
     $psi.Arguments = Join-Args $argList
     $psi.UseShellExecute = $false
     $psi.RedirectStandardInput = $true
     $psi.CreateNoWindow = $true
-    $psi.EnvironmentVariables['FFREPORT'] = 'file=' + (($reportPath -replace '\\', '/') -replace ':', '\:') + ':level=32'
+    $psi.RedirectStandardOutput = $readStdout
+    if ($reportPath) { $psi.EnvironmentVariables['FFREPORT'] = 'file=' + (($reportPath -replace '\\', '/') -replace ':', '\:') + ':level=32' }
     Write-Log "ffmpeg start: $($psi.Arguments)"
     $p = [System.Diagnostics.Process]::Start($psi)
     Write-Log "ffmpeg pid=$($p.Id) report=$reportPath"
@@ -189,6 +371,34 @@ $script:outFile = $null
 $script:startedAt = $null
 $script:config = $null
 
+function Get-OutWidth($screen, [int]$outH) {
+    $w = [int][Math]::Round($screen.W * $outH / $screen.H)
+    $w - ($w % 2)
+}
+
+function Get-OverlayXY($screen, [int]$outH, [int]$camSize) {
+    $outW = Get-OutWidth $screen $outH
+    $r = [RecDpi]::RectPhysical($script:bubble.Handle)
+    $x = [int](($r[0] - $screen.X) * $outW / $screen.W)
+    $y = [int](($r[1] - $screen.Y) * $outH / $screen.H)
+    $x = [Math]::Max(0, [Math]::Min($x, $outW - $camSize))
+    $y = [Math]::Max(0, [Math]::Min($y, $outH - $camSize))
+    Write-Log ("bubble rect={0},{1} {2}x{3} -> overlay {4},{5} in {6}x{7}" -f $r[0], $r[1], $r[2], $r[3], $x, $y, $outW, $outH)
+    @($x, $y)
+}
+
+function Test-RecordingLive {
+    try {
+        $fs = [IO.File]::Open($ProgressFile, 'Open', 'Read', 'ReadWrite')
+        try { $text = (New-Object IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Dispose() }
+    } catch {
+        return $false
+    }
+    $m = [regex]::Matches($text, 'out_time_us=(\d+)')
+    if ($m.Count -eq 0) { return $false }
+    [long]$m[$m.Count - 1].Groups[1].Value -gt 0
+}
+
 function Get-Preset([string]$name) {
     $p = $Presets | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if ($p) { $p } else { $Presets | Where-Object { $_.Name -eq $DefaultPreset } }
@@ -208,14 +418,24 @@ function Start-Recording($screen, [string]$mic, [string]$cam, [bool]$forceGdi, [
     $h = $h - ($h % 2)
     $camSize = [int]($h / 5)
     $camSize = $camSize - ($camSize % 2)
-    $script:enc = [pscustomobject]@{ Name = $preset.Name; H = $h; Fps = $preset.Fps; Crf = $preset.Crf; Cam = $camSize }
-    Write-Log ("quality {0}: height={1} fps={2} crf={3} cam={4}" -f $preset.Name, $h, $preset.Fps, $preset.Crf, $camSize)
+    $preview = [bool]($cam -and $script:bubble -and $script:bubble.Visible)
+    $margin = [int]($h * $CamMargin / 720)
+    if ($preview) {
+        $xy = Get-OverlayXY $screen $h $camSize
+        $ox = $xy[0]; $oy = $xy[1]
+    } else {
+        $ox = "W-w-$margin"; $oy = "H-h-$margin"
+    }
+    $script:enc = [pscustomobject]@{ Name = $preset.Name; H = $h; Fps = $preset.Fps; Crf = $preset.Crf; Cam = $camSize; OX = $ox; OY = $oy; Preview = $preview }
+    Write-Log ("quality {0}: height={1} fps={2} crf={3} cam={4} overlay={5},{6} preview={7}" -f $preset.Name, $h, $preset.Fps, $preset.Crf, $camSize, $ox, $oy, $preview)
     $script:outFile = New-OutputPath
     $useDda = $screen.Primary -and -not $forceGdi
     $script:config = @{ Screen = $screen; Mic = $mic; Cam = $cam; UseDda = $useDda; Quality = $preset.Name }
     Write-Log ("record screen={0} dda={1} mic={2} cam={3} out={4}" -f $screen.Label, $useDda, $mic, $cam, $script:outFile)
     $report = Join-Path $ToolDir 'ffmpeg-last.log'
-    $script:proc = Start-Ffmpeg $script:ffmpeg (Build-FfmpegArgs $screen $useDda $mic $cam $script:outFile) $report
+    Remove-Item $ProgressFile -ErrorAction SilentlyContinue
+    $script:proc = Start-Ffmpeg $script:ffmpeg (Build-FfmpegArgs $screen $useDda $mic $cam $script:outFile) $report $script:enc.Preview
+    if ($script:enc.Preview) { $script:bubble.Attach($script:proc.StandardOutput.BaseStream) }
     $script:startedAt = Get-Date
 }
 
@@ -307,6 +527,64 @@ $form.Controls.Add($lblStatus)
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
 
+$script:bubble = New-Object CamBubble
+$script:countdown = New-Object CountdownForm
+$script:preview = $null
+$script:counting = $false
+$script:countStart = $null
+
+$cdTimer = New-Object System.Windows.Forms.Timer
+$cdTimer.Interval = 100
+
+function Get-SelectedScreen { $script:screens[$cbScreen.SelectedIndex] }
+
+function Get-SelectedCam { if ($cbCam.SelectedIndex -gt 0) { [string]$cbCam.SelectedItem } else { $null } }
+
+function Move-BubbleHome($screen) {
+    $size = [int]($screen.H / 5)
+    $margin = [int]($screen.H * $CamMargin / 720)
+    [RecDpi]::PlacePhysical($script:bubble.Handle, $screen.X + $screen.W - $size - $margin, $screen.Y + $screen.H - $size - $margin, $size, $size)
+    Write-Log ("bubble placed on {0} size={1}" -f $screen.Label, $size)
+}
+
+function Start-Preview {
+    if ($script:preview -and -not $script:preview.HasExited) { return }
+    $cam = Get-SelectedCam
+    if (-not $cam) { $script:bubble.Hide(); Write-Log 'preview off: no webcam selected'; return }
+    $argList = @('-hide_banner', '-loglevel', 'error', '-f', 'dshow', '-rtbufsize', '64M', '-vcodec', 'mjpeg', '-video_size', '640x480', '-framerate', '30',
+        '-i', "video=$cam", '-vf', "fps=15,crop='min(iw,ih)':'min(iw,ih)',scale=${PreviewSize}:${PreviewSize},format=yuvj420p",
+        '-c:v', 'mjpeg', '-q:v', '5', '-f', 'mjpeg', 'pipe:1')
+    $script:preview = Start-Ffmpeg $script:ffmpeg $argList $null $true
+    $script:bubble.Attach($script:preview.StandardOutput.BaseStream)
+    if (-not $script:bubble.Visible) {
+        $script:bubble.Show()
+        Move-BubbleHome (Get-SelectedScreen)
+    }
+}
+
+function Stop-Preview {
+    if ($script:preview) {
+        Stop-Ffmpeg $script:preview
+        Write-Log ("preview stopped frames={0} bad={1} last={2}" -f $script:bubble.Frames, $script:bubble.BadFrames, $script:bubble.LastError)
+        $script:preview = $null
+    }
+}
+
+function Send-OverlayMove {
+    if (-not $script:proc -or $script:proc.HasExited -or -not $script:config.Cam -or -not $script:enc.Preview) { return }
+    $xy = Get-OverlayXY $script:config.Screen $script:enc.H $script:enc.Cam
+    try {
+        $script:proc.StandardInput.Write('c')
+        $script:proc.StandardInput.Write("overlay@cam -1 x $($xy[0])`n")
+        $script:proc.StandardInput.Write('c')
+        $script:proc.StandardInput.Write("overlay@cam -1 y $($xy[1])`n")
+        $script:proc.StandardInput.Flush()
+        Write-Log ("overlay moved to {0},{1}" -f $xy[0], $xy[1])
+    } catch {
+        Write-Log "overlay move failed: $_"
+    }
+}
+
 function Set-Idle([string]$status) {
     $timer.Stop()
     $btnRec.Enabled = $true; $btnStop.Enabled = $false
@@ -317,44 +595,109 @@ function Set-Idle([string]$status) {
     $lblStatus.Text = $status
 }
 
+function Stop-Countdown {
+    $cdTimer.Stop()
+    $script:countdown.Hide()
+    $script:counting = $false
+}
+
 function Complete-Recording {
     if ($script:busy) { return }
     $script:busy = $true
+    $cancelled = $script:counting
+    if ($script:counting) { Stop-Countdown }
     $btnStop.Enabled = $false
-    $lblStatus.Text = 'Saving...'
+    $lblStatus.Text = if ($cancelled) { 'Cancelling...' } else { 'Saving...' }
     $form.Refresh()
     Stop-Ffmpeg $script:proc
-    $saved = Convert-ToMp4 $script:ffmpeg $script:outFile
+    if ($script:enc.Preview) { Write-Log ("recording preview frames={0} bad={1} last={2}" -f $script:bubble.Frames, $script:bubble.BadFrames, $script:bubble.LastError) }
     $script:proc = $null
-    if ($saved) {
-        Set-Idle ("Saved {0} ({1:N1} MB)" -f (Split-Path $saved -Leaf), ((Get-Item $saved).Length / 1MB))
+    if ($cancelled) {
+        Remove-Item $script:outFile -ErrorAction SilentlyContinue
+        Write-Log 'cancelled during countdown, file removed'
+        Set-Idle 'Cancelled.'
     } else {
-        Set-Idle 'Nothing was recorded. See ScreenRecorder.log next to the app.'
+        $saved = Convert-ToMp4 $script:ffmpeg $script:outFile
+        if ($saved) {
+            Set-Idle ("Saved {0} ({1:N1} MB)" -f (Split-Path $saved -Leaf), ((Get-Item $saved).Length / 1MB))
+        } else {
+            Set-Idle 'Nothing was recorded. See ScreenRecorder.log next to the app.'
+        }
     }
+    Start-Preview
     $script:busy = $false
 }
 
 $script:busy = $false
 
+function Start-Countdown($screen) {
+    $script:counting = $true
+    $script:countStart = Get-Date
+    $size = [int]($screen.H / 5)
+    $script:countdown.Value = '3'
+    $script:countdown.Show()
+    [RecDpi]::PlacePhysical($script:countdown.Handle, [int]($screen.X + ($screen.W - $size) / 2), [int]($screen.Y + ($screen.H - $size) / 2), $size, $size)
+    $lblStatus.Text = 'Starting...'
+    $cdTimer.Start()
+}
+
 function Invoke-Record {
-        try {
-            $screen = $script:screens[$cbScreen.SelectedIndex]
-            $mic = if ($cbMic.SelectedIndex -gt 0) { [string]$cbMic.SelectedItem } else { $null }
-            $cam = if ($cbCam.SelectedIndex -gt 0) { [string]$cbCam.SelectedItem } else { $null }
-            $quality = $Presets[$cbQuality.SelectedIndex].Name
-            Save-Settings $quality
-            Start-Recording $screen $mic $cam $false $quality
-            $btnRec.Enabled = $false; $btnStop.Enabled = $true
-            $cbScreen.Enabled = $false; $cbMic.Enabled = $false; $cbCam.Enabled = $false; $cbQuality.Enabled = $false
+    try {
+        $screen = Get-SelectedScreen
+        $mic = if ($cbMic.SelectedIndex -gt 0) { [string]$cbMic.SelectedItem } else { $null }
+        $cam = Get-SelectedCam
+        $quality = $Presets[$cbQuality.SelectedIndex].Name
+        Save-Settings $quality
+        Stop-Preview
+        Start-Recording $screen $mic $cam $false $quality
+        $btnRec.Enabled = $false; $btnStop.Enabled = $true
+        $cbScreen.Enabled = $false; $cbMic.Enabled = $false; $cbCam.Enabled = $false; $cbQuality.Enabled = $false
+        $form.Text = 'REC - Screen Recorder'
+        Start-Countdown $screen
+    } catch {
+        Write-Log "start failed: $_"
+        Set-Idle "Could not start: $_"
+        Start-Preview
+    }
+}
+
+$cdTimer.Add_Tick({
+        if ($script:proc.HasExited) {
+            if (Test-FallbackNeeded) { return }
+            Write-Log "ffmpeg exited during countdown code=$($script:proc.ExitCode)"
+            Stop-Countdown
+            Complete-Recording
+            $lblStatus.Text = 'Could not start recording. See ScreenRecorder.log.'
+            return
+        }
+        $elapsed = ((Get-Date) - $script:countStart).TotalSeconds
+        $live = Test-RecordingLive
+        if ($elapsed -lt 3) {
+            $script:countdown.Value = [string](3 - [int][Math]::Floor($elapsed))
+        } elseif (-not $live) {
+            $script:countdown.Value = '...'
+        } else {
+            Write-Log ("countdown done, recording live {0:N1}s after Record" -f $elapsed)
+            Stop-Countdown
+            $script:startedAt = Get-Date
             $lblStatus.Text = 'Recording... 00:00'
-            $form.Text = 'REC - Screen Recorder'
             $timer.Start()
             $form.WindowState = 'Minimized'
-        } catch {
-            Write-Log "start failed: $_"
-            Set-Idle "Could not start: $_"
         }
-}
+    })
+
+$script:bubble.Add_DragEnded({
+        Write-Log 'bubble dragged'
+        Send-OverlayMove
+    })
+
+$cbScreen.Add_SelectedIndexChanged({ if ($script:bubble.Visible) { Move-BubbleHome (Get-SelectedScreen) } })
+
+$cbCam.Add_SelectedIndexChanged({
+        if ($script:proc) { return }
+        Stop-Preview
+        Start-Preview
+    })
 
 $btnRec.Add_Click({ Invoke-Record })
 
@@ -387,8 +730,16 @@ $poll.Add_Tick({
     })
 $poll.Start()
 
+$form.Add_Shown({
+        Write-Log ("main window excluded from capture={0}" -f [RecDpi]::ExcludeFromCapture($form.Handle))
+        Start-Preview
+    })
+
 $form.Add_FormClosing({
         if ($script:proc -and -not $script:proc.HasExited) { Complete-Recording }
+        Stop-Preview
+        $script:bubble.Close()
+        $script:countdown.Close()
     })
 
 [void]$form.ShowDialog()
