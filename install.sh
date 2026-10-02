@@ -11,6 +11,7 @@ INCLUDE_LINE="#Include $WIN_DIR_W\\screen-recorder-hotkey.ahk"
 
 mkdir -p "$WIN_DIR"
 cp "$HERE/ScreenRecorder.ps1" "$WIN_DIR/"
+mkdir -p "$WIN_DIR/selftest" && cp "$HERE/selftest/loopback-test.ps1" "$WIN_DIR/selftest/"
 sed 's/$/\r/' "$HERE/screen-recorder-hotkey.ahk" > "$WIN_DIR/screen-recorder-hotkey.ahk"
 echo "deployed -> $WIN_DIR_W"
 
