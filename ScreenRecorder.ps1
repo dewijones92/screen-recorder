@@ -12,7 +12,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $ToolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogFile = Join-Path $ToolDir 'ScreenRecorder.log'
-if (-not $OutDir) { $OutDir = [Environment]::GetFolderPath('MyVideos') }
+if (-not $OutDir) { $OutDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Temp\ScreenRecorder' }
+[void](New-Item -ItemType Directory -Force $OutDir)
 $SettingsFile = Join-Path $ToolDir 'settings.json'
 $Presets = @(
     [pscustomobject]@{ Name = 'Small';    H = 720;  Fps = 15; Crf = 28; Label = 'Small - 720p, ~1 MB/min' }
@@ -206,7 +207,13 @@ public class CountdownForm : Form {
     }
 }
 '@
-Add-Type -TypeDefinition $NativeCode -ReferencedAssemblies System.Windows.Forms, System.Drawing
+$sha = [Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($NativeCode))
+$NativeDll = Join-Path $ToolDir ('RecNative-{0}.dll' -f ([BitConverter]::ToString($sha, 0, 6) -replace '-', ''))
+if (-not (Test-Path $NativeDll)) {
+    Get-ChildItem $ToolDir -Filter 'RecNative-*.dll' | Remove-Item -ErrorAction SilentlyContinue
+    Add-Type -TypeDefinition $NativeCode -ReferencedAssemblies System.Windows.Forms, System.Drawing -OutputAssembly $NativeDll -OutputType Library
+}
+Add-Type -Path $NativeDll
 
 function Write-Log([string]$msg) {
     $line = '{0:yyyy-MM-dd HH:mm:ss.fff} {1}' -f (Get-Date), $msg
@@ -222,14 +229,17 @@ function Find-Ffmpeg {
     throw 'ffmpeg.exe not found on PATH or in the winget packages folder'
 }
 
-function Get-DshowDevices([string]$ffmpeg) {
+function Start-DeviceScan([string]$ffmpeg) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $ffmpeg
     $psi.Arguments = '-hide_banner -list_devices true -f dshow -i dummy'
     $psi.UseShellExecute = $false
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
-    $p = [System.Diagnostics.Process]::Start($psi)
+    [System.Diagnostics.Process]::Start($psi)
+}
+
+function Read-DeviceScan($p) {
     $text = $p.StandardError.ReadToEnd()
     $p.WaitForExit()
     $video = @(); $audio = @()
@@ -361,10 +371,52 @@ if (-not $Headless) {
     Remove-Item $ToggleFile -ErrorAction SilentlyContinue
 }
 
+function Read-Settings {
+    try { Get-Content $SettingsFile -Raw | ConvertFrom-Json } catch { $null }
+}
+
+function Read-SavedPreset { (Read-Settings).Quality }
+
+function Save-Settings([string]$quality, $devices) {
+    $old = Read-Settings
+    if (-not $quality) { $quality = $old.Quality }
+    if (-not $devices) { $devices = $old.Devices }
+    $data = @{ Quality = $quality }
+    if ($devices) { $data.Devices = @{ Video = @($devices.Video | Where-Object { $_ }); Audio = @($devices.Audio | Where-Object { $_ }) } }
+    try { $data | ConvertTo-Json -Depth 4 | Set-Content -Path $SettingsFile -Encoding UTF8 } catch { Write-Log "saving settings failed: $_" }
+}
+
+function Copy-PathToClipboard([string]$path) {
+    for ($i = 1; $i -le 5; $i++) {
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($path)
+            Start-Sleep -Milliseconds 50
+            $back = [System.Windows.Forms.Clipboard]::GetText()
+            if ($back -eq $path) { Write-Log "copied to clipboard (attempt $i): $path"; return $true }
+            Write-Log ("clipboard read-back mismatch (attempt {0}): got {1} chars" -f $i, $back.Length)
+        } catch {
+            Write-Log "clipboard busy (attempt $i): $_"
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    $false
+}
+
 $script:ffmpeg = Find-Ffmpeg
-Write-Log "---- ScreenRecorder start headless=$Headless ffmpeg=$script:ffmpeg"
+$LaunchedAt = (Get-Process -Id $PID).StartTime
+function Get-SinceLaunch { [int]((Get-Date) - $LaunchedAt).TotalMilliseconds }
+Write-Log "---- ScreenRecorder start headless=$Headless ffmpeg=$script:ffmpeg out=$OutDir since-launch=$(Get-SinceLaunch)ms"
 $script:screens = Get-PhysicalScreens
-$script:devices = Get-DshowDevices $script:ffmpeg
+$cachedDevices = (Read-Settings).Devices
+if ($Headless -or -not $cachedDevices) {
+    $script:devices = Read-DeviceScan (Start-DeviceScan $script:ffmpeg)
+    if (-not $Headless) { Save-Settings $null $script:devices }
+    $script:deviceScan = $null
+} else {
+    $script:devices = [pscustomobject]@{ Video = @($cachedDevices.Video); Audio = @($cachedDevices.Audio) }
+    Write-Log ("devices from cache video=[{0}] audio=[{1}], rescanning in background" -f ($script:devices.Video -join '; '), ($script:devices.Audio -join '; '))
+    $script:deviceScan = Start-DeviceScan $script:ffmpeg
+}
 $defaultMic = @($script:devices.Audio | Where-Object { $_ -match 'EPOS' }) + @($script:devices.Audio) | Select-Object -First 1
 $defaultCam = @($script:devices.Video) | Select-Object -First 1
 
@@ -404,14 +456,6 @@ function Test-RecordingLive {
 function Get-Preset([string]$name) {
     $p = $Presets | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if ($p) { $p } else { $Presets | Where-Object { $_.Name -eq $DefaultPreset } }
-}
-
-function Read-SavedPreset {
-    try { (Get-Content $SettingsFile -Raw | ConvertFrom-Json).Quality } catch { $null }
-}
-
-function Save-Settings([string]$quality) {
-    try { @{ Quality = $quality } | ConvertTo-Json | Set-Content -Path $SettingsFile -Encoding UTF8 } catch { Write-Log "saving settings failed: $_" }
 }
 
 function Start-Recording($screen, [string]$mic, [string]$cam, [bool]$forceGdi, [string]$quality) {
@@ -523,7 +567,7 @@ $form.Controls.Add($btnFolder)
 
 $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Location = New-Object System.Drawing.Point(14, 192); $lblStatus.Size = New-Object System.Drawing.Size(330, 34)
-$lblStatus.Text = 'Ready. Recordings go to your Videos folder.'
+$lblStatus.Text = 'Ready. Saves to %TEMP%\ScreenRecorder and copies the path.'
 $form.Controls.Add($lblStatus)
 
 $timer = New-Object System.Windows.Forms.Timer
@@ -621,7 +665,8 @@ function Complete-Recording {
     } else {
         $saved = Convert-ToMp4 $script:ffmpeg $script:outFile
         if ($saved) {
-            Set-Idle ("Saved {0} ({1:N1} MB)" -f (Split-Path $saved -Leaf), ((Get-Item $saved).Length / 1MB))
+            $copied = if (Copy-PathToClipboard $saved) { 'path copied' } else { 'could not copy path' }
+            Set-Idle ("Saved {0} ({1:N1} MB), {2}" -f (Split-Path $saved -Leaf), ((Get-Item $saved).Length / 1MB), $copied)
         } else {
             Set-Idle 'Nothing was recorded. See ScreenRecorder.log next to the app.'
         }
@@ -720,9 +765,35 @@ $timer.Add_Tick({
         $lblStatus.Text = ('Recording... {0:mm\:ss}  ({1:N1} MB)' -f $elapsed, $mb)
     })
 
+function Update-DeviceList($combo, [string[]]$names, [string]$preferred, [string]$autoPicked) {
+    $current = [string]$combo.SelectedItem
+    $existing = @($combo.Items | Select-Object -Skip 1)
+    if (($existing -join "`n") -eq ($names -join "`n")) { return }
+    $auto = if ($autoPicked) { $autoPicked } else { '(off)' }
+    $want = if ($current -eq $auto) { $preferred } elseif ($names -contains $current -or $current -eq '(off)') { $current } else { $preferred }
+    $combo.Items.Clear()
+    [void]$combo.Items.Add('(off)')
+    foreach ($n in $names) { [void]$combo.Items.Add($n) }
+    $i = if ($want) { $combo.Items.IndexOf($want) } else { 0 }
+    $combo.SelectedIndex = [Math]::Max(0, $i)
+    Write-Log ("device list changed, now [{0}], selected {1}" -f ($names -join '; '), $combo.SelectedItem)
+}
+
 $poll = New-Object System.Windows.Forms.Timer
 $poll.Interval = 200
 $poll.Add_Tick({
+        if ($script:deviceScan -and $script:deviceScan.HasExited) {
+            $script:devices = Read-DeviceScan $script:deviceScan
+            $script:deviceScan = $null
+            Save-Settings $null $script:devices
+            if (-not $script:proc) {
+                $prefMic = @($script:devices.Audio | Where-Object { $_ -match 'EPOS' }) + @($script:devices.Audio) | Select-Object -First 1
+                Update-DeviceList $cbMic $script:devices.Audio $prefMic $defaultMic
+                Update-DeviceList $cbCam $script:devices.Video (@($script:devices.Video) | Select-Object -First 1) $defaultCam
+            } else {
+                Write-Log 'device rescan finished while recording, lists left as they were'
+            }
+        }
         if (-not (Test-Path $ToggleFile)) { return }
         Remove-Item $ToggleFile -ErrorAction SilentlyContinue
         if ($script:busy) { Write-Log 'hotkey: ignored, still saving' }
@@ -733,7 +804,7 @@ $poll.Add_Tick({
 $poll.Start()
 
 $form.Add_Shown({
-        Write-Log ("main window excluded from capture={0}" -f [RecDpi]::ExcludeFromCapture($form.Handle))
+        Write-Log ("main window shown since-launch={0}ms, excluded from capture={1}" -f (Get-SinceLaunch), [RecDpi]::ExcludeFromCapture($form.Handle))
         Start-Preview
     })
 

@@ -7,8 +7,12 @@ ffmpeg already installed through winget, so nothing else to install.
   minute for a mostly still screen.
 - Mic as 64 kbps mono AAC.
 - Webcam cropped to a square, 1/5 of the frame height, in the bottom-right corner.
-- Saved to `Videos\rec-<date>_<time>.mp4`. It records to `.mkv` first, so a crash still leaves a
-  usable file, then remuxes to `.mp4` on stop.
+- Saved to `%LOCALAPPDATA%\Temp\ScreenRecorder\rec-<date>_<time>.mp4`, and the full path is copied
+  to the clipboard. It records to `.mkv` first, so a crash still leaves a usable file, then remuxes
+  to `.mp4` on stop. Windows' temp clean-up (Storage Sense, Disk Clean-up) may delete old
+  recordings there, so move any you want to keep.
+- Encoded as limited-range BT.709, so players that ignore the range flag still show light
+  backgrounds correctly.
 
 ## Use
 
@@ -43,6 +47,9 @@ from `\\wsl$`), creates the desktop shortcut, adds one `#Include` line to
 - Other screens: `gdigrab` with the screen's physical-pixel bounds. `ddagrab` cannot reach a screen
   driven by the other GPU on this laptop.
 - Mic and webcam come in as one DirectShow input so they share a clock.
+- The device list is cached in `settings.json` so the window opens without waiting for ffmpeg to
+  list devices (about 1 s, sometimes 5). A rescan runs in the background and updates the lists if
+  anything was plugged in or removed. The C# helpers are compiled once to `RecNative-<hash>.dll`.
 - The live preview is a second ffmpeg output (MJPEG on stdout) read by a small C# window. Before
   recording, a separate preview-only ffmpeg feeds it; it hands the camera over on Record.
 - Dragging the square sends `overlay@cam` x/y commands to the running ffmpeg on stdin (`c` key).
