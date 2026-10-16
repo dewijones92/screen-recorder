@@ -819,12 +819,9 @@ $timer.Add_Tick({
         $lblStatus.Text = ('Recording... {0:mm\:ss}  ({1:N1} MB)' -f $elapsed, $mb)
     })
 
-function Update-DeviceList($combo, [string[]]$names, [string]$preferred, [string]$autoPicked) {
-    $current = [string]$combo.SelectedItem
+function Update-DeviceList($combo, [string[]]$names, [string]$want) {
     $existing = @($combo.Items | Select-Object -Skip 1)
     if (($existing -join "`n") -eq ($names -join "`n")) { return }
-    $auto = if ($autoPicked) { $autoPicked } else { '(off)' }
-    $want = if ($current -eq $auto) { $preferred } elseif ($names -contains $current -or $current -eq '(off)') { $current } else { $preferred }
     $combo.Items.Clear()
     [void]$combo.Items.Add('(off)')
     foreach ($n in $names) { [void]$combo.Items.Add($n) }
@@ -883,10 +880,11 @@ $poll.Add_Tick({
             $script:deviceScan = $null
             Save-Settings @{ Devices = (ConvertTo-DeviceCache $script:devices) }
             if (-not $script:proc) {
-                $prefMic = Get-PreferredDevice $script:devices.Audio $savedChoices.Mic (Get-DefaultMic $script:devices.Audio)
-                $prefCam = Get-PreferredDevice $script:devices.Video $savedChoices.Webcam (@($script:devices.Video) | Select-Object -First 1)
-                Update-DeviceList $cbMic $script:devices.Audio $prefMic $defaultMic
-                Update-DeviceList $cbCam $script:devices.Video $prefCam $defaultCam
+                $current = Read-Settings
+                $prefMic = Get-PreferredDevice $script:devices.Audio $current.Mic (Get-DefaultMic $script:devices.Audio)
+                $prefCam = Get-PreferredDevice $script:devices.Video $current.Webcam (@($script:devices.Video) | Select-Object -First 1)
+                Update-DeviceList $cbMic $script:devices.Audio $prefMic
+                Update-DeviceList $cbCam $script:devices.Video $prefCam
             } else {
                 Write-Log 'device rescan finished while recording, lists left as they were'
             }
