@@ -283,24 +283,26 @@ function Build-FfmpegArgs($screen, [bool]$useDda, [string]$mic, [string]$cam, [s
         $a.AddRange([string[]]@('-i', ($parts -join ':')))
         $screenIdx = 1
     }
+    $toTv = 'out_color_matrix=bt709:out_range=tv,format=yuv420p'
+    $tag = 'setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709'
     if ($useDda) {
         $a.AddRange([string[]]@('-thread_queue_size', '1024', '-f', 'lavfi', '-i', ("ddagrab=output_idx=0:framerate={0}:video_size={1}x{2}" -f $script:enc.Fps, $screen.W, $screen.H)))
-        $scr = "[${screenIdx}:v]hwdownload,format=bgra,scale=-2:$($script:enc.H)"
+        $scr = "[${screenIdx}:v]hwdownload,format=bgra,scale=-2:$($script:enc.H):$toTv"
     } else {
         $a.AddRange([string[]]@('-thread_queue_size', '1024', '-f', 'gdigrab', '-framerate', "$($script:enc.Fps)", '-draw_mouse', '1',
                 '-offset_x', "$($screen.X)", '-offset_y', "$($screen.Y)", '-video_size', ("{0}x{1}" -f $screen.W, $screen.H), '-i', 'desktop'))
-        $scr = "[${screenIdx}:v]scale=-2:$($script:enc.H)"
+        $scr = "[${screenIdx}:v]scale=-2:$($script:enc.H):$toTv"
     }
     if ($cam) {
         $camChain = "[0:v]fps=$($e.Fps),crop='min(iw,ih)':'min(iw,ih)'"
         if ($e.Preview) {
-            $camChain += ",split=2[c1][c2];[c1]scale=$($e.Cam):$($e.Cam)[cam];[c2]scale=${PreviewSize}:${PreviewSize},format=yuvj420p[prev]"
+            $camChain += ",split=2[c1][c2];[c1]scale=$($e.Cam):$($e.Cam):$toTv[cam];[c2]scale=${PreviewSize}:${PreviewSize},format=yuvj420p[prev]"
         } else {
-            $camChain += ",scale=$($e.Cam):$($e.Cam)[cam]"
+            $camChain += ",scale=$($e.Cam):$($e.Cam):$toTv[cam]"
         }
-        $fc = "$scr[scr];$camChain;[scr][cam]overlay@cam=x=$($e.OX):y=$($e.OY),format=yuv420p[v]"
+        $fc = "$scr[scr];$camChain;[scr][cam]overlay@cam=x=$($e.OX):y=$($e.OY),$tag[v]"
     } else {
-        $fc = "$scr,format=yuv420p[v]"
+        $fc = "$scr,$tag[v]"
     }
     $a.AddRange([string[]]@('-filter_complex', $fc, '-map', '[v]'))
     if ($mic) { $a.AddRange([string[]]@('-map', '0:a', '-c:a', 'aac', '-b:a', '64k', '-ac', '1')) }
