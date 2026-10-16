@@ -35,6 +35,11 @@ Screen, mic, webcam and quality are remembered in `settings.json` and picked aga
 changes you make are saved, so a device that happens to be unplugged at startup does not overwrite
 your choice; it is picked again once it is back.
 
+Next to the mic list, a green headphones icon means the EPOS headset is connected and a red sad face
+means it is not. The app checks Windows' list of active audio inputs every 2 seconds (a 4 ms
+registry read). When it changes, it re-lists devices with ffmpeg and switches to the headset when
+it appears, unless you picked a different mic yourself.
+
 ## Install / update
 
 ```bash

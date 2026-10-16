@@ -28,6 +28,9 @@ $PreviewSize = 240
 $script:bubble = $null
 $ToggleFile = Join-Path $ToolDir 'toggle.request'
 $ProgressFile = Join-Path $ToolDir 'progress.txt'
+$HeadsetPattern = 'EPOS'
+$HeadsetIcon = [char]::ConvertFromUtf32(0x1F3A7)
+$SadIcon = [char]::ConvertFromUtf32(0x1F641)
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -395,7 +398,19 @@ function Get-PreferredDevice([string[]]$names, [string]$saved, [string]$fallback
     $fallback
 }
 
-function Get-DefaultMic([string[]]$names) { @($names | Where-Object { $_ -match 'EPOS' }) + @($names) | Select-Object -First 1 }
+function Get-DefaultMic([string[]]$names) { @($names | Where-Object { $_ -match $HeadsetPattern }) + @($names) | Select-Object -First 1 }
+
+function Get-ActiveCaptureKeys {
+    $root = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture')
+    try {
+        @($root.GetSubKeyNames() | Where-Object {
+                $k = $root.OpenSubKey($_)
+                try { (([int]$k.GetValue('DeviceState', 0)) -band 0xF) -eq 1 } finally { $k.Close() }
+            }) -join ','
+    } finally {
+        $root.Close()
+    }
+}
 
 function Copy-FileToClipboard([string]$path) {
     for ($i = 1; $i -le 5; $i++) {
@@ -537,7 +552,7 @@ $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-$form.ClientSize = New-Object System.Drawing.Size(360, 232)
+$form.ClientSize = New-Object System.Drawing.Size(388, 232)
 
 function Add-Row([string]$text, [int]$y) {
     $lbl = New-Object System.Windows.Forms.Label
@@ -562,6 +577,14 @@ $cbMic = Add-Row 'Mic' 46
 [void]$cbMic.Items.Add('(off)')
 foreach ($m in $script:devices.Audio) { [void]$cbMic.Items.Add($m) }
 $cbMic.SelectedIndex = if ($defaultMic) { $cbMic.Items.IndexOf($defaultMic) } else { 0 }
+
+$lblHeadset = New-Object System.Windows.Forms.Label
+$lblHeadset.Location = New-Object System.Drawing.Point(348, 44); $lblHeadset.Size = New-Object System.Drawing.Size(32, 26)
+$lblHeadset.Font = New-Object System.Drawing.Font('Segoe UI Emoji', 13)
+$lblHeadset.TextAlign = 'MiddleCenter'
+$form.Controls.Add($lblHeadset)
+$headsetTip = New-Object System.Windows.Forms.ToolTip
+$script:headsetPresent = $null
 
 $cbCam = Add-Row 'Webcam' 78
 [void]$cbCam.Items.Add('(off)')
@@ -810,9 +833,51 @@ function Update-DeviceList($combo, [string[]]$names, [string]$preferred, [string
     Write-Log ("device list changed, now [{0}], selected {1}" -f ($names -join '; '), $combo.SelectedItem)
 }
 
+function Update-HeadsetIndicator([bool]$announce) {
+    $headset = @($script:devices.Audio | Where-Object { $_ -match $HeadsetPattern }) | Select-Object -First 1
+    $present = [bool]$headset
+    if ($present) {
+        $lblHeadset.Text = $HeadsetIcon; $lblHeadset.ForeColor = [System.Drawing.Color]::ForestGreen
+        $headsetTip.SetToolTip($lblHeadset, "Headset connected: $headset")
+    } else {
+        $lblHeadset.Text = $SadIcon; $lblHeadset.ForeColor = [System.Drawing.Color]::Firebrick
+        $headsetTip.SetToolTip($lblHeadset, 'Headset not detected. Plug it in and it is picked up automatically.')
+    }
+    if ($script:headsetPresent -ne $present) {
+        Write-Log ("headset present={0} ({1}), mic selected={2}" -f $present, $headset, $cbMic.SelectedItem)
+        if ($announce -and -not $script:proc -and -not $script:busy) {
+            $lblStatus.Text = if ($present) { "Headset connected. Mic: $($cbMic.SelectedItem)" } else { "Headset not detected. Mic: $($cbMic.SelectedItem)" }
+        }
+    }
+    $script:headsetPresent = $present
+}
+
+$script:captureKeys = $null
+$script:rescanAt = $null
+$script:pollTicks = 0
+
 $poll = New-Object System.Windows.Forms.Timer
 $poll.Interval = 200
 $poll.Add_Tick({
+        $script:pollTicks++
+        if ($script:pollTicks % 10 -eq 1) {
+            try {
+                $keys = Get-ActiveCaptureKeys
+                if ($null -eq $script:captureKeys) {
+                    $script:captureKeys = $keys
+                } elseif ($keys -ne $script:captureKeys) {
+                    Write-Log 'audio inputs changed in Windows, rescanning devices in 1s'
+                    $script:captureKeys = $keys
+                    $script:rescanAt = (Get-Date).AddSeconds(1)
+                }
+            } catch {
+                Write-Log "audio input check failed: $_"
+            }
+        }
+        if ($script:rescanAt -and (Get-Date) -ge $script:rescanAt -and -not $script:deviceScan) {
+            $script:rescanAt = $null
+            $script:deviceScan = Start-DeviceScan $script:ffmpeg
+        }
         if ($script:deviceScan -and $script:deviceScan.HasExited) {
             $script:devices = Read-DeviceScan $script:deviceScan
             $script:deviceScan = $null
@@ -825,6 +890,7 @@ $poll.Add_Tick({
             } else {
                 Write-Log 'device rescan finished while recording, lists left as they were'
             }
+            Update-HeadsetIndicator $true
         }
         if (-not (Test-Path $ToggleFile)) { return }
         Remove-Item $ToggleFile -ErrorAction SilentlyContinue
@@ -833,6 +899,7 @@ $poll.Add_Tick({
         elseif ($btnRec.Enabled) { Write-Log 'hotkey: record'; Invoke-Record }
         else { Write-Log 'hotkey: ignored, not ready' }
     })
+Update-HeadsetIndicator $false
 $poll.Start()
 
 $form.Add_Shown({
