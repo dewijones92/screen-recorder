@@ -7,8 +7,9 @@ ffmpeg already installed through winget, so nothing else to install.
   minute for a mostly still screen.
 - Mic as 64 kbps mono AAC.
 - Webcam cropped to a square, 1/5 of the frame height, in the bottom-right corner.
-- Saved to `%LOCALAPPDATA%\Temp\ScreenRecorder\rec-<date>_<time>.mp4`, and the full path is copied
-  to the clipboard. It records to `.mkv` first, so a crash still leaves a usable file, then remuxes
+- Saved to `%LOCALAPPDATA%\Temp\ScreenRecorder\rec-<date>_<time>.mp4`, and the file itself is put
+  on the clipboard as Explorer's Ctrl+C does, so Ctrl+V pastes the video into Slack, a browser
+  upload or a folder. It records to `.mkv` first, so a crash still leaves a usable file, then remuxes
   to `.mp4` on stop. Windows' temp clean-up (Storage Sense, Disk Clean-up) may delete old
   recordings there, so move any you want to keep.
 - Encoded as limited-range BT.709, so players that ignore the range flag still show light
@@ -29,6 +30,10 @@ ffmpeg already installed through winget, so nothing else to install.
 - Pressing the hotkey during the countdown cancels the recording.
 
 The window minimises while recording.
+
+Screen, mic, webcam and quality are remembered in `settings.json` and picked again next time. Only
+changes you make are saved, so a device that happens to be unplugged at startup does not overwrite
+your choice; it is picked again once it is back.
 
 ## Install / update
 

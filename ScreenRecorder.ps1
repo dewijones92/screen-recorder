@@ -377,23 +377,39 @@ function Read-Settings {
 
 function Read-SavedPreset { (Read-Settings).Quality }
 
-function Save-Settings([string]$quality, $devices) {
+function Save-Settings([hashtable]$changes) {
+    $data = @{}
     $old = Read-Settings
-    if (-not $quality) { $quality = $old.Quality }
-    if (-not $devices) { $devices = $old.Devices }
-    $data = @{ Quality = $quality }
-    if ($devices) { $data.Devices = @{ Video = @($devices.Video | Where-Object { $_ }); Audio = @($devices.Audio | Where-Object { $_ }) } }
+    if ($old) { foreach ($prop in $old.PSObject.Properties) { $data[$prop.Name] = $prop.Value } }
+    foreach ($k in $changes.Keys) { $data[$k] = $changes[$k] }
     try { $data | ConvertTo-Json -Depth 4 | Set-Content -Path $SettingsFile -Encoding UTF8 } catch { Write-Log "saving settings failed: $_" }
 }
 
-function Copy-PathToClipboard([string]$path) {
+function ConvertTo-DeviceCache($devices) {
+    @{ Video = @($devices.Video | Where-Object { $_ }); Audio = @($devices.Audio | Where-Object { $_ }) }
+}
+
+function Get-PreferredDevice([string[]]$names, [string]$saved, [string]$fallback) {
+    if ($saved -eq '(off)') { return '(off)' }
+    if ($saved -and $names -contains $saved) { return $saved }
+    $fallback
+}
+
+function Get-DefaultMic([string[]]$names) { @($names | Where-Object { $_ -match 'EPOS' }) + @($names) | Select-Object -First 1 }
+
+function Copy-FileToClipboard([string]$path) {
     for ($i = 1; $i -le 5; $i++) {
         try {
-            [System.Windows.Forms.Clipboard]::SetText($path)
+            $files = New-Object System.Collections.Specialized.StringCollection
+            [void]$files.Add($path)
+            $data = New-Object System.Windows.Forms.DataObject
+            $data.SetFileDropList($files)
+            $data.SetData('Preferred DropEffect', (New-Object IO.MemoryStream(, [byte[]](1, 0, 0, 0))))
+            [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
             Start-Sleep -Milliseconds 50
-            $back = [System.Windows.Forms.Clipboard]::GetText()
-            if ($back -eq $path) { Write-Log "copied to clipboard (attempt $i): $path"; return $true }
-            Write-Log ("clipboard read-back mismatch (attempt {0}): got {1} chars" -f $i, $back.Length)
+            $back = @([System.Windows.Forms.Clipboard]::GetFileDropList())
+            if ($back.Count -eq 1 -and $back[0] -eq $path) { Write-Log "copied file to clipboard (attempt $i): $path"; return $true }
+            Write-Log ("clipboard read-back mismatch (attempt {0}): got [{1}]" -f $i, ($back -join '; '))
         } catch {
             Write-Log "clipboard busy (attempt $i): $_"
         }
@@ -410,15 +426,17 @@ $script:screens = Get-PhysicalScreens
 $cachedDevices = (Read-Settings).Devices
 if ($Headless -or -not $cachedDevices) {
     $script:devices = Read-DeviceScan (Start-DeviceScan $script:ffmpeg)
-    if (-not $Headless) { Save-Settings $null $script:devices }
+    if (-not $Headless) { Save-Settings @{ Devices = (ConvertTo-DeviceCache $script:devices) } }
     $script:deviceScan = $null
 } else {
     $script:devices = [pscustomobject]@{ Video = @($cachedDevices.Video); Audio = @($cachedDevices.Audio) }
     Write-Log ("devices from cache video=[{0}] audio=[{1}], rescanning in background" -f ($script:devices.Video -join '; '), ($script:devices.Audio -join '; '))
     $script:deviceScan = Start-DeviceScan $script:ffmpeg
 }
-$defaultMic = @($script:devices.Audio | Where-Object { $_ -match 'EPOS' }) + @($script:devices.Audio) | Select-Object -First 1
-$defaultCam = @($script:devices.Video) | Select-Object -First 1
+$savedChoices = if ($Headless) { $null } else { Read-Settings }
+$defaultMic = Get-PreferredDevice $script:devices.Audio $savedChoices.Mic (Get-DefaultMic $script:devices.Audio)
+$defaultCam = Get-PreferredDevice $script:devices.Video $savedChoices.Webcam (@($script:devices.Video) | Select-Object -First 1)
+Write-Log ("saved choices screen={0} mic={1} webcam={2} quality={3} -> starting with mic={4} webcam={5}" -f $savedChoices.Screen, $savedChoices.Mic, $savedChoices.Webcam, $savedChoices.Quality, $defaultMic, $defaultCam)
 
 $script:proc = $null
 $script:outFile = $null
@@ -533,7 +551,12 @@ function Add-Row([string]$text, [int]$y) {
 
 $cbScreen = Add-Row 'Screen' 14
 foreach ($s in $script:screens) { [void]$cbScreen.Items.Add($s.Label) }
-$cbScreen.SelectedIndex = 0
+$screenIdx = [array]::IndexOf(@($script:screens | ForEach-Object Label), [string]$savedChoices.Screen)
+if ($screenIdx -lt 0 -and $savedChoices.Screen) {
+    $prefix = ([string]$savedChoices.Screen -split ' \(')[0]
+    $screenIdx = [array]::IndexOf(@($script:screens | ForEach-Object { ($_.Label -split ' \(')[0] }), $prefix)
+}
+$cbScreen.SelectedIndex = [Math]::Max(0, $screenIdx)
 
 $cbMic = Add-Row 'Mic' 46
 [void]$cbMic.Items.Add('(off)')
@@ -567,7 +590,7 @@ $form.Controls.Add($btnFolder)
 
 $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Location = New-Object System.Drawing.Point(14, 192); $lblStatus.Size = New-Object System.Drawing.Size(330, 34)
-$lblStatus.Text = 'Ready. Saves to %TEMP%\ScreenRecorder and copies the path.'
+$lblStatus.Text = 'Ready. Saves to %TEMP%\ScreenRecorder and copies the video, ready to paste.'
 $form.Controls.Add($lblStatus)
 
 $timer = New-Object System.Windows.Forms.Timer
@@ -665,7 +688,7 @@ function Complete-Recording {
     } else {
         $saved = Convert-ToMp4 $script:ffmpeg $script:outFile
         if ($saved) {
-            $copied = if (Copy-PathToClipboard $saved) { 'path copied' } else { 'could not copy path' }
+            $copied = if (Copy-FileToClipboard $saved) { 'copied, ready to paste' } else { 'could not copy to clipboard' }
             Set-Idle ("Saved {0} ({1:N1} MB), {2}" -f (Split-Path $saved -Leaf), ((Get-Item $saved).Length / 1MB), $copied)
         } else {
             Set-Idle 'Nothing was recorded. See ScreenRecorder.log next to the app.'
@@ -694,7 +717,7 @@ function Invoke-Record {
         $mic = if ($cbMic.SelectedIndex -gt 0) { [string]$cbMic.SelectedItem } else { $null }
         $cam = Get-SelectedCam
         $quality = $Presets[$cbQuality.SelectedIndex].Name
-        Save-Settings $quality
+        Save-Choices
         Stop-Preview
         Start-Recording $screen $mic $cam $false $quality
         $btnRec.Enabled = $false; $btnStop.Enabled = $true
@@ -739,6 +762,14 @@ $script:bubble.Add_DragEnded({
     })
 
 $cbScreen.Add_SelectedIndexChanged({ if ($script:bubble.Visible) { Move-BubbleHome (Get-SelectedScreen) } })
+
+function Save-Choices {
+    $choices = @{ Screen = [string]$cbScreen.SelectedItem; Mic = [string]$cbMic.SelectedItem; Webcam = [string]$cbCam.SelectedItem; Quality = $Presets[$cbQuality.SelectedIndex].Name }
+    Save-Settings $choices
+    Write-Log ("saved choices screen={0} mic={1} webcam={2} quality={3}" -f $choices.Screen, $choices.Mic, $choices.Webcam, $choices.Quality)
+}
+
+foreach ($cb in $cbScreen, $cbMic, $cbCam, $cbQuality) { $cb.Add_SelectionChangeCommitted({ Save-Choices }) }
 
 $cbCam.Add_SelectedIndexChanged({
         if ($script:proc) { return }
@@ -785,11 +816,12 @@ $poll.Add_Tick({
         if ($script:deviceScan -and $script:deviceScan.HasExited) {
             $script:devices = Read-DeviceScan $script:deviceScan
             $script:deviceScan = $null
-            Save-Settings $null $script:devices
+            Save-Settings @{ Devices = (ConvertTo-DeviceCache $script:devices) }
             if (-not $script:proc) {
-                $prefMic = @($script:devices.Audio | Where-Object { $_ -match 'EPOS' }) + @($script:devices.Audio) | Select-Object -First 1
+                $prefMic = Get-PreferredDevice $script:devices.Audio $savedChoices.Mic (Get-DefaultMic $script:devices.Audio)
+                $prefCam = Get-PreferredDevice $script:devices.Video $savedChoices.Webcam (@($script:devices.Video) | Select-Object -First 1)
                 Update-DeviceList $cbMic $script:devices.Audio $prefMic $defaultMic
-                Update-DeviceList $cbCam $script:devices.Video (@($script:devices.Video) | Select-Object -First 1) $defaultCam
+                Update-DeviceList $cbCam $script:devices.Video $prefCam $defaultCam
             } else {
                 Write-Log 'device rescan finished while recording, lists left as they were'
             }
