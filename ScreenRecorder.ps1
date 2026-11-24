@@ -290,7 +290,7 @@ function Build-FfmpegArgs($screen, [bool]$useDda, [string]$mic, [string]$cam, [s
     if ($cam) { $parts += "video=$cam" }
     if ($mic) { $parts += "audio=$mic" }
     if ($parts.Count -gt 0) {
-        $a.AddRange([string[]]@('-thread_queue_size', '1024', '-f', 'dshow', '-rtbufsize', '256M'))
+        $a.AddRange([string[]]@('-f', 'dshow', '-rtbufsize', '256M'))
         if ($cam) { $a.AddRange([string[]]@('-vcodec', 'mjpeg', '-video_size', '640x480', '-framerate', '30')) }
         if ($mic) { $a.AddRange([string[]]@('-audio_buffer_size', '50')) }
         $a.AddRange([string[]]@('-i', ($parts -join ':')))
@@ -299,10 +299,10 @@ function Build-FfmpegArgs($screen, [bool]$useDda, [string]$mic, [string]$cam, [s
     $toTv = 'out_color_matrix=bt709:out_range=tv,format=yuv420p'
     $tag = 'setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709'
     if ($useDda) {
-        $a.AddRange([string[]]@('-thread_queue_size', '1024', '-f', 'lavfi', '-i', ("ddagrab=output_idx=0:framerate={0}:video_size={1}x{2}" -f $script:enc.Fps, $screen.W, $screen.H)))
+        $a.AddRange([string[]]@('-f', 'lavfi', '-i', ("ddagrab=output_idx=0:framerate={0}:video_size={1}x{2}" -f $script:enc.Fps, $screen.W, $screen.H)))
         $scr = "[${screenIdx}:v]hwdownload,format=bgra,scale=-2:$($script:enc.H):$toTv"
     } else {
-        $a.AddRange([string[]]@('-thread_queue_size', '1024', '-f', 'gdigrab', '-framerate', "$($script:enc.Fps)", '-draw_mouse', '1',
+        $a.AddRange([string[]]@('-f', 'gdigrab', '-framerate', "$($script:enc.Fps)", '-draw_mouse', '1',
                 '-offset_x', "$($screen.X)", '-offset_y', "$($screen.Y)", '-video_size', ("{0}x{1}" -f $screen.W, $screen.H), '-i', 'desktop'))
         $scr = "[${screenIdx}:v]scale=-2:$($script:enc.H):$toTv"
     }
